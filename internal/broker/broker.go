@@ -1,10 +1,9 @@
-package types
+package broker
 
 import (
 	"context"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -12,34 +11,34 @@ import (
 
 type Broker struct {
 	mu     sync.Mutex
-	queues map[string]*MsgQueue
+	queues map[string]*queue
 }
 
-func NewBroker() *Broker {
+func New() *Broker {
 	return &Broker{
-		queues: make(map[string]*MsgQueue),
+		queues: make(map[string]*queue),
 	}
 }
 
 func (b *Broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	title := strings.Trim(r.URL.Path, "/")
-	if title == "" {
+	name := strings.Trim(r.URL.Path, "/")
+	if name == "" {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
 	switch r.Method {
 	case http.MethodPut:
-		b.handlePut(w, r, title)
+		b.handlePut(w, r, name)
 	case http.MethodGet:
-		b.handleGet(w, r, title)
+		b.handleGet(w, r, name)
 	default:
 		w.Header().Set("Allow", strings.Join([]string{http.MethodGet, http.MethodPut}, ", "))
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
 }
 
-func (b *Broker) handlePut(w http.ResponseWriter, r *http.Request, title string) {
+func (b *Broker) handlePut(w http.ResponseWriter, r *http.Request, name string) {
 	const msgParam = "v"
 
 	query := r.URL.Query()
@@ -47,17 +46,17 @@ func (b *Broker) handlePut(w http.ResponseWriter, r *http.Request, title string)
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	b.put(title, query.Get(msgParam))
+	b.put(name, query.Get(msgParam))
 	w.WriteHeader(http.StatusOK)
 }
 
-func (b *Broker) handleGet(w http.ResponseWriter, r *http.Request, title string) {
+func (b *Broker) handleGet(w http.ResponseWriter, r *http.Request, name string) {
 	timeout, ok := parseTimeout(r.URL.Query())
 	if !ok {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	msg, ok := b.get(r.Context(), title, timeout)
+	msg, ok := b.get(r.Context(), name, timeout)
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		return
@@ -72,25 +71,25 @@ func parseTimeout(query url.Values) (time.Duration, bool) {
 		return 0, true
 	}
 
-	timeoutSeconds, err := strconv.ParseUint(query.Get(timeoutParam), 10, 64)
-	if err != nil {
+	timeout, err := time.ParseDuration(query.Get(timeoutParam) + "s")
+	if err != nil || timeout < 0 {
 		return 0, false
 	}
 
-	return time.Duration(timeoutSeconds) * time.Second, true
+	return timeout, true
 }
 
-func (b *Broker) put(title, msg string) {
+func (b *Broker) put(name, msg string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	q := b.getOrCreateQueue(title)
-	q.Push(msg)
+	q := b.getOrCreateQueue(name)
+	q.push(msg)
 	b.cleanup(q)
 }
 
-func (b *Broker) get(ctx context.Context, title string, timeout time.Duration) (string, bool) {
-	msg, ok := b.getMessage(title)
+func (b *Broker) get(ctx context.Context, name string, timeout time.Duration) (string, bool) {
+	msg, ok := b.getMessage(name)
 	if ok {
 		return msg, true
 	}
@@ -98,15 +97,15 @@ func (b *Broker) get(ctx context.Context, title string, timeout time.Duration) (
 		return "", false
 	}
 
-	return b.waitMessage(ctx, title, timeout)
+	return b.waitMessage(ctx, name, timeout)
 }
 
-func (b *Broker) getMessage(title string) (string, bool) {
+func (b *Broker) getMessage(name string) (string, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if q := b.queues[title]; q != nil {
-		msg, ok := q.PopMessage()
+	if q := b.queues[name]; q != nil {
+		msg, ok := q.pop()
 		if !ok {
 			return "", false
 		}
@@ -117,11 +116,11 @@ func (b *Broker) getMessage(title string) (string, bool) {
 	return "", false
 }
 
-func (b *Broker) waitMessage(ctx context.Context, title string, timeout time.Duration) (string, bool) {
+func (b *Broker) waitMessage(ctx context.Context, name string, timeout time.Duration) (string, bool) {
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	ch, cancelWait := b.newWaiter(title)
+	ch, cancelWait := b.registerPendingGet(name)
 	return wait(waitCtx, ch, cancelWait)
 }
 
@@ -144,40 +143,42 @@ func wait(ctx context.Context, ch <-chan string, cancelWait func() bool) (string
 	}
 }
 
-func (b *Broker) newWaiter(title string) (<-chan string, func() bool) {
+func (b *Broker) registerPendingGet(name string) (<-chan string, func() bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	q := b.getOrCreateQueue(title)
-	if msg, ok := q.PopMessage(); ok {
+	q := b.getOrCreateQueue(name)
+	if msg, ok := q.pop(); ok {
 		b.cleanup(q)
 		ch := make(chan string, 1)
 		ch <- msg
 		return ch, func() bool { return false }
 	}
 
-	elem, ch := q.NewWaiter()
-	return ch, func() bool {
+	pending := q.addPendingGet()
+	return pending.ch, func() bool {
 		b.mu.Lock()
 		defer b.mu.Unlock()
 
-		q.RemoveWaiter(elem)
+		if !q.cancelPendingGet(pending) {
+			return false
+		}
 		b.cleanup(q)
 		return true
 	}
 }
 
-func (b *Broker) getOrCreateQueue(title string) *MsgQueue {
-	q := b.queues[title]
+func (b *Broker) getOrCreateQueue(name string) *queue {
+	q := b.queues[name]
 	if q == nil {
-		q = NewQueue(title)
-		b.queues[title] = q
+		q = newQueue(name)
+		b.queues[name] = q
 	}
 	return q
 }
 
-func (b *Broker) cleanup(q *MsgQueue) {
-	if q.Empty() && b.queues[q.Title()] == q {
-		delete(b.queues, q.Title())
+func (b *Broker) cleanup(q *queue) {
+	if q.empty() && b.queues[q.name] == q {
+		delete(b.queues, q.name)
 	}
 }
